@@ -69,37 +69,68 @@ async function sendTgNotification(settings, message) {
 }
 
 async function handleCronTrigger(env) {
-    console.log("Cron trigger fired. Checking all subscriptions...");
+    console.log("Cron trigger fired. Checking all subscriptions for traffic and node count...");
     const allSubs = await env.MISUB_KV.get(KV_KEY_SUBS, 'json') || [];
     const settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || defaultSettings;
     let changesMade = false;
 
+    const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//gm;
+
     for (const sub of allSubs) {
         if (sub.url.startsWith('http') && sub.enabled) {
-            // 複用 /api/node_count 的流量獲取邏輯
             try {
+                // --- 並行請求流量和節點內容 ---
                 const trafficRequest = fetch(new Request(sub.url, { 
                     headers: { 'User-Agent': 'Clash for Windows/0.20.39' }, 
                     redirect: "follow",
                     cf: { insecureSkipVerify: true } 
                 }));
-                const response = await Promise.race([trafficRequest, new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))]);
+                const nodeCountRequest = fetch(new Request(sub.url, { 
+                    headers: { 'User-Agent': 'MiSub-Cron-Updater/1.0' }, 
+                    redirect: "follow",
+                    cf: { insecureSkipVerify: true } 
+                }));
+                const [trafficResult, nodeCountResult] = await Promise.allSettled([
+                    Promise.race([trafficRequest, new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 8000))]),
+                    Promise.race([nodeCountRequest, new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 8000))])
+                ]);   
 
-                if (response.ok) {
-                    const userInfoHeader = response.headers.get('subscription-userinfo');
+                if (trafficResult.status === 'fulfilled' && trafficResult.value.ok) {
+                    const userInfoHeader = trafficResult.value.headers.get('subscription-userinfo');
                     if (userInfoHeader) {
                         const info = {};
                         userInfoHeader.split(';').forEach(part => {
                             const [key, value] = part.trim().split('=');
                             if (key && value) info[key] = /^\d+$/.test(value) ? Number(value) : value;
                         });
-                        sub.userInfo = info; // 更新流量信息
+                        sub.userInfo = info; // 更新流量資訊
                         await checkAndNotify(sub, settings, env); // 檢查並發送通知
                         changesMade = true;
                     }
+                } else if (trafficResult.status === 'rejected') {
+                     console.error(`Cron: Failed to fetch traffic for ${sub.name}:`, trafficResult.reason.message);
                 }
+
+                if (nodeCountResult.status === 'fulfilled' && nodeCountResult.value.ok) {
+                    const text = await nodeCountResult.value.text();
+                    let decoded = '';
+                    try { 
+                        // 嘗試 Base64 解碼
+                        decoded = atob(text.replace(/\s/g, '')); 
+                    } catch { 
+                        decoded = text; 
+                    }
+                    const matches = decoded.match(nodeRegex);
+                    if (matches) {
+                        sub.nodeCount = matches.length; // 更新節點數量
+                        changesMade = true;
+                    }
+                } else if (nodeCountResult.status === 'rejected') {
+                    console.error(`Cron: Failed to fetch node list for ${sub.name}:`, nodeCountResult.reason.message);
+                }
+
             } catch(e) {
-                console.error(`Cron: Failed to update ${sub.name}`, e.message);
+                console.error(`Cron: Unhandled error while updating ${sub.name}`, e.message);
             }
         }
     }
@@ -107,9 +138,11 @@ async function handleCronTrigger(env) {
     // 如果有任何通知時間戳被更新，則保存回 KV
     if (changesMade) {
         await env.MISUB_KV.put(KV_KEY_SUBS, JSON.stringify(allSubs));
-        console.log("订阅通知时间戳已更新。");
+        console.log("Subscriptions updated with new traffic info and node counts.");
+    } else {
+        console.log("Cron job finished. No changes detected.");
     }
-    return new Response("Cron 作业完成。", { status: 200 });
+    return new Response("Cron job completed successfully.", { status: 200 });
 }
 
 // --- 认证与API处理的核心函数 (无修改) ---
@@ -473,7 +506,7 @@ function prependNodeName(link, prefix) {
 
 // --- 节点列表生成函数 ---
 async function generateCombinedNodeList(context, config, userAgent, misubs, prependedContent = '') {
-    const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls):\/\//;
+    const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//;
     let manualNodesContent = '';
     const normalizeVmessLink = (link) => {
         if (!link.startsWith('vmess://')) return link;
@@ -522,19 +555,89 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
             } catch (e) {}
             let validNodes = text.replace(/\r\n/g, '\n').split('\n')
                 .map(line => line.trim()).filter(line => nodeRegex.test(line));
-            // 新增：根据 exclude 规则过滤节点
+
+            // [核心重構] 引入白名單 (keep:) 和黑名單 (exclude) 模式
             if (sub.exclude && sub.exclude.trim() !== '') {
-                try {
-                    const regex = new RegExp(sub.exclude.trim(), 'i');
-                    validNodes = validNodes.filter(nodeLink => {
-                        const hashIndex = nodeLink.lastIndexOf('#');
-                        if (hashIndex === -1) return true; // 没有节点名称，无法过滤，保留
-                        const nodeName = decodeURIComponent(nodeLink.substring(hashIndex + 1));
-                        return !regex.test(nodeName);
+                const rules = sub.exclude.trim().split('\n').map(r => r.trim()).filter(Boolean);
+                
+                const keepRules = rules.filter(r => r.toLowerCase().startsWith('keep:'));
+
+                if (keepRules.length > 0) {
+                    // --- 白名單模式 (Inclusion Mode) ---
+                    const nameRegexParts = [];
+                    const protocolsToKeep = new Set();
+
+                    keepRules.forEach(rule => {
+                        const content = rule.substring('keep:'.length).trim();
+                        if (content.toLowerCase().startsWith('proto:')) {
+                            const protocols = content.substring('proto:'.length).split(',').map(p => p.trim().toLowerCase());
+                            protocols.forEach(p => protocolsToKeep.add(p));
+                        } else {
+                            nameRegexParts.push(content);
+                        }
                     });
-                } catch (e) {
-                    console.error(`Invalid regex for subscription ${sub.name}: ${sub.exclude}`, e);
-                    // 正则表达式无效时，不进行过滤，保留所有节点
+
+                    const nameRegex = nameRegexParts.length > 0 ? new RegExp(nameRegexParts.join('|'), 'i') : null;
+                    
+                    validNodes = validNodes.filter(nodeLink => {
+                        // 檢查協議是否匹配
+                        const protocolMatch = nodeLink.match(/^(.*?):\/\//);
+                        const protocol = protocolMatch ? protocolMatch[1].toLowerCase() : '';
+                        if (protocolsToKeep.has(protocol)) {
+                            return true;
+                        }
+
+                        // 檢查名稱是否匹配
+                        if (nameRegex) {
+                            const hashIndex = nodeLink.lastIndexOf('#');
+                            if (hashIndex !== -1) {
+                                try {
+                                    const nodeName = decodeURIComponent(nodeLink.substring(hashIndex + 1));
+                                    if (nameRegex.test(nodeName)) {
+                                        return true;
+                                    }
+                                } catch (e) { /* 忽略解碼錯誤 */ }
+                            }
+                        }
+                        return false; // 白名單模式下，不匹配任何規則則排除
+                    });
+
+                } else {
+                    // --- 黑名單模式 (Exclusion Mode) ---
+                    const protocolsToExclude = new Set();
+                    const nameRegexParts = [];
+
+                    rules.forEach(rule => {
+                        if (rule.toLowerCase().startsWith('proto:')) {
+                            const protocols = rule.substring('proto:'.length).split(',').map(p => p.trim().toLowerCase());
+                            protocols.forEach(p => protocolsToExclude.add(p));
+                        } else {
+                            nameRegexParts.push(rule);
+                        }
+                    });
+                    
+                    const nameRegex = nameRegexParts.length > 0 ? new RegExp(nameRegexParts.join('|'), 'i') : null;
+
+                    validNodes = validNodes.filter(nodeLink => {
+                        const protocolMatch = nodeLink.match(/^(.*?):\/\//);
+                        const protocol = protocolMatch ? protocolMatch[1].toLowerCase() : '';
+                        if (protocolsToExclude.has(protocol)) {
+                            return false;
+                        }
+
+                        if (nameRegex) {
+                            const hashIndex = nodeLink.lastIndexOf('#');
+                            if (hashIndex !== -1) {
+                                try {
+                                    const nodeName = decodeURIComponent(nodeLink.substring(hashIndex + 1));
+                                    if (nameRegex.test(nodeName)) {
+                                        return false;
+                                    }
+                                } catch (e) { /* 忽略解碼錯誤 */ }
+                            }
+                        }
+                        return true;
+                    });
                 }
             }
             return (config.prependSubName && sub.name)
@@ -589,6 +692,8 @@ async function handleMisubRequest(context) {
     let effectiveSubConverter;
     let effectiveSubConfig;
 
+    const DEFAULT_EXPIRED_VLESS_NODE = "vless://88888888-8888-8888-8888-888888888888@127.0.0.1:1234?encryption=none&security=tls&sni=daoqi.chaoqi.com&fp=random&allowInsecure=1&type=ws&host=daoqi.chaoqi.com&path=%2F%3Fed%3D2560#%E6%82%A8%E7%9A%84%E8%AE%A2%E9%98%85%E5%B7%B2%E5%88%B0%E6%9C%9F";
+
     if (profileIdentifier) {
 
         // [修正] 使用 config 變量
@@ -597,14 +702,31 @@ async function handleMisubRequest(context) {
         }
         const profile = allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier);
         if (profile && profile.enabled) {
+            // Check if the profile has an expiration date and if it's expired
+            if (profile.expiresAt) {
+                const expiryDate = new Date(profile.expiresAt);
+                const now = new Date();
+                if (now > expiryDate) {
+                    console.log(`Profile ${profile.name} (ID: ${profile.id}) has expired.`);
+                    return new Response(DEFAULT_EXPIRED_VLESS_NODE, {
+                        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+                    });
+                }
+            }
+
             subName = profile.name;
             const profileSubIds = new Set(profile.subscriptions);
             const profileNodeIds = new Set(profile.manualNodes);
             targetMisubs = allMisubs.filter(item => {
-                if (item.url.startsWith('http')) {
-                    return item.enabled && profileSubIds.has(item.id);
+                const isSubscription = item.url.startsWith('http');
+                const isManualNode = !isSubscription;
+
+                // Check if the item belongs to the current profile and is enabled
+                const belongsToProfile = (isSubscription && profileSubIds.has(item.id)) || (isManualNode && profileNodeIds.has(item.id));
+                if (!item.enabled || !belongsToProfile) {
+                    return false;
                 }
-                return item.enabled && profileNodeIds.has(item.id);    
+                return true;
             });
             effectiveSubConverter = profile.subConverter && profile.subConverter.trim() !== '' ? profile.subConverter : config.subConverter;
             effectiveSubConfig = profile.subConfig && profile.subConfig.trim() !== '' ? profile.subConfig : config.subConfig;

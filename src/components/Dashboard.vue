@@ -205,7 +205,7 @@ const handleBulkImport = (importText) => {
       const newItem = { id: crypto.randomUUID(), name: extractNodeName(line) || '未命名', url: line, enabled: true, status: 'unchecked' };
       if (/^https?:\/\//.test(line)) {
           newSubs.push(newItem);
-      } else if (/^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls):\/\//.test(line)) {
+      } else if (/^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//.test(line)) {
           newNodes.push(newItem);
       }
   }
@@ -275,7 +275,7 @@ const handleProfileToggle = (updatedProfile) => {
 };
 const handleAddProfile = () => {
     isNewProfile.value = true;
-    editingProfile.value = { name: '', enabled: true, subscriptions: [], manualNodes: [], customId: '', subConverter: '', subConfig: ''};
+    editingProfile.value = { name: '', enabled: true, subscriptions: [], manualNodes: [], customId: '', subConverter: '', subConfig: '', expiresAt: ''};
     showProfileModal.value = true;
 };
 const handleEditProfile = (profileId) => {
@@ -283,6 +283,7 @@ const handleEditProfile = (profileId) => {
     if (profile) {
         isNewProfile.value = false;
         editingProfile.value = JSON.parse(JSON.stringify(profile));
+        editingProfile.value.expiresAt = profile.expiresAt || ''; // Ensure expiresAt is copied
         showProfileModal.value = true;
     }
 };
@@ -602,8 +603,15 @@ const formattedTotalRemainingTraffic = computed(() => formatBytes(totalRemaining
         <div><label for="sub-edit-name" class="block text-sm font-medium text-gray-700 dark:text-gray-300">订阅名称</label><input type="text" id="sub-edit-name" v-model="editingSubscription.name" placeholder="（可选）不填将自动获取" class="mt-1 block w-full px-3 py-2 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm dark:text-white"></div>
         <div><label for="sub-edit-url" class="block text-sm font-medium text-gray-700 dark:text-gray-300">订阅链接</label><input type="text" id="sub-edit-url" v-model="editingSubscription.url" placeholder="https://..." class="mt-1 block w-full px-3 py-2 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm font-mono dark:text-white"></div>
         <div>
-          <label for="sub-edit-exclude" class="block text-sm font-medium text-gray-700 dark:text-gray-300">排除节点 (正则表达式)</label>
-          <textarea id="sub-edit-exclude" v-model="editingSubscription.exclude" placeholder="输入需要排除的节点名称的正则表达式，例如：(过期|官网)" rows="3" class="mt-1 block w-full px-3 py-2 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm font-mono dark:text-white"></textarea>
+          <label for="sub-edit-exclude" class="block text-sm font-medium text-gray-700 dark:text-gray-300">包含/排除节点</label>
+          <textarea 
+            id="sub-edit-exclude" 
+            v-model="editingSubscription.exclude"
+            placeholder="[排除模式 (默认)]&#10;proto:vless,trojan&#10;(过期|官网)&#10;---&#10;[包含模式 (只保留匹配项)]&#10;keep:(香港|HK)&#10;keep:proto:ss"
+            rows="5" 
+            class="mt-1 block w-full px-3 py-2 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm font-mono dark:text-white">
+          </textarea>
+          <p class="text-xs text-gray-400 mt-1">每行一条规则。使用 `keep:` 切换为白名单模式。</p>
         </div>
       </div>
     </template>
