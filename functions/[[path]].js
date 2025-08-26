@@ -868,6 +868,16 @@ function prependNodeName(link, prefix) {
   return appendToFragment(link, prefix);
 }
 
+/**
+ * 根据客户端类型确定合适的用户代理
+ * @param {string} originalUserAgent - 原始用户代理字符串
+ * @returns {string} - 处理后的用户代理字符串
+ */
+function getProcessedUserAgent(originalUserAgent) {
+    // 保持原始 User-Agent，移除所有特殊处理
+    return originalUserAgent;
+}
+
 // --- 节点列表生成函数 ---
 async function generateCombinedNodeList(context, config, userAgent, misubs, prependedContent = '') {
     const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//;
@@ -882,7 +892,9 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
     const httpSubs = misubs.filter(sub => sub.url.toLowerCase().startsWith('http'));
     const subPromises = httpSubs.map(async (sub) => {
         try {
-            const requestHeaders = { 'User-Agent': userAgent };
+            // 使用处理后的用户代理
+            const processedUserAgent = getProcessedUserAgent(userAgent);
+            const requestHeaders = { 'User-Agent': processedUserAgent };
             const response = await Promise.race([
                 fetch(new Request(sub.url, { headers: requestHeaders, redirect: "follow", cf: { insecureSkipVerify: true } })),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('Request timed out')), 10000))
@@ -1008,7 +1020,6 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
 }
 
 // --- [核心修改] 订阅处理函数 ---
-// --- [最終修正版 - 變量名校對] 訂閱處理函數 ---
 async function handleMisubRequest(context) {
     const { request, env } = context;
     const url = new URL(request.url);
