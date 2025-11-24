@@ -11,8 +11,7 @@ if ('serviceWorker' in navigator) {
         scope: '/'
       });
 
-      // 开发环境下不输出SW注册信息
-      if (!import.meta.env.DEV) {
+      if (import.meta.env.DEV) {
         console.log('SW registered: ', registration);
       }
 
@@ -22,8 +21,7 @@ if ('serviceWorker' in navigator) {
         if (newWorker) {
           newWorker.addEventListener('statechange', () => {
             if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-              // 通知应用有新版本可用
-              if (!import.meta.env.DEV) {
+              if (import.meta.env.DEV) {
                 console.log('New SW version available');
               }
               // 发送消息给PWA更新组件
@@ -36,7 +34,7 @@ if ('serviceWorker' in navigator) {
       });
 
     } catch (error) {
-      if (!import.meta.env.DEV) {
+      if (import.meta.env.DEV) {
         console.log('SW registration failed: ', error);
       }
     }
@@ -45,7 +43,7 @@ if ('serviceWorker' in navigator) {
   // 监听来自Service Worker的消息
   navigator.serviceWorker.addEventListener('message', (event) => {
     if (event.data && event.data.type === 'SW_UPDATE_AVAILABLE') {
-      if (!import.meta.env.DEV) {
+      if (import.meta.env.DEV) {
         console.log('收到SW更新通知');
       }
       // 这里可以触发更新UI显示

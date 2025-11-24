@@ -1,3 +1,5 @@
+CLAUDE.md
+wrangler.toml
 # Logs
 logs
 *.log
@@ -24,6 +26,5 @@ dist-ssr
 .settings/
 *.sublime-workspace
 .vscode
-CLAUDE.md
 # Misc
 .DS_Store
