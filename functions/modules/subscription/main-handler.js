@@ -3,7 +3,7 @@ import { migrateConfigSettings, formatBytes, getCallbackToken } from '../utils.j
 import { generateCombinedNodeList } from '../../services/subscription-service.js';
 import { sendEnhancedTgNotification } from '../notifications.js';
 import { KV_KEY_SUBS, KV_KEY_PROFILES, KV_KEY_SETTINGS, DEFAULT_SETTINGS as defaultSettings } from '../config.js';
-import { renderDisguisePage } from '../disguise-page.js';
+import { createDisguiseResponse } from '../disguise-page.js';
 import { generateCacheKey, setCache } from '../../services/node-cache-service.js';
 import { resolveRequestContext } from './request-context.js';
 import { buildSubconverterUrlVariants, getSubconverterCandidates } from './subconverter-client.js';
@@ -42,16 +42,7 @@ export async function handleMisubRequest(context) {
         const isAuthenticated = await authMiddleware(request, env); // Returns boolean
 
         if (!isAuthenticated) {
-            if (config.disguise.pageType === 'redirect' && config.disguise.redirectUrl) {
-                let redirectUrl = config.disguise.redirectUrl.trim();
-                // Ensure URL has a protocol
-                if (!/^https?:\/\//i.test(redirectUrl)) {
-                    redirectUrl = 'https://' + redirectUrl;
-                }
-                return Response.redirect(redirectUrl, 302);
-            } else {
-                return renderDisguisePage();
-            }
+            return createDisguiseResponse(config.disguise, request.url);
         }
     }
 
@@ -63,6 +54,7 @@ export async function handleMisubRequest(context) {
     let effectiveSubConverter;
     let effectiveSubConfig;
     let isProfileExpired = false; // Moved declaration here
+    let shouldUseEmoji = false;   // 是否在 subconverter 请求中启用 emoji
 
     const DEFAULT_EXPIRED_NODE = `trojan://00000000-0000-0000-0000-000000000000@127.0.0.1:443#${encodeURIComponent('您的订阅已失效')}`;
 
@@ -103,6 +95,20 @@ export async function handleMisubRequest(context) {
             }
             effectiveSubConverter = profile.subConverter && profile.subConverter.trim() !== '' ? profile.subConverter : config.subConverter;
             effectiveSubConfig = profile.subConfig && profile.subConfig.trim() !== '' ? profile.subConfig : config.subConfig;
+
+            // 判断是否需要在 subconverter 中启用 emoji：使用回退逻辑（订阅组 > 全局 > 默认）
+            const defaultTemplate = '{emoji}{region}-{protocol}-{index}';
+            const globalNodeTransform = config.defaultNodeTransform || {};
+            const profileNodeTransform = profile.nodeTransform || {};
+
+            // 确定有效的 nodeTransform 配置
+            const effectiveTransform = profileNodeTransform.enabled !== undefined
+                ? profileNodeTransform
+                : (globalNodeTransform.enabled ? globalNodeTransform : profileNodeTransform);
+
+            const userTemplate = effectiveTransform?.rename?.template?.template || defaultTemplate;
+            const templateEnabled = effectiveTransform?.enabled && effectiveTransform?.rename?.template?.enabled;
+            shouldUseEmoji = templateEnabled && userTemplate.includes('{emoji}');
 
             // [新增] 增加订阅组下载计数
             // 仅在非回调请求时及非内部请求时增加计数(避免重复计数)
@@ -258,9 +264,26 @@ export async function handleMisubRequest(context) {
         };
 
         const currentProfile = profileIdentifier ? allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier) : null;
+
+        // 设置优先级：订阅组设置 > 全局设置 > 内置默认值
+        // prefixSettings 回退逻辑
+        const effectivePrefixSettings = {
+            ...(config.defaultPrefixSettings || {}),    // 全局设置（已包含内置默认值）
+            ...(currentProfile?.prefixSettings || {})   // 订阅组设置覆盖
+        };
+
+        // nodeTransform 回退逻辑
+        const globalNodeTransform = config.defaultNodeTransform || {};
+        const profileNodeTransform = currentProfile?.nodeTransform || {};
+
+        // 深度合并 nodeTransform（订阅组优先）
+        const effectiveNodeTransform = profileNodeTransform.enabled !== undefined
+            ? profileNodeTransform  // 如果订阅组明确启用/禁用了转换，使用订阅组设置
+            : (globalNodeTransform.enabled ? globalNodeTransform : profileNodeTransform);  // 否则尝试全局设置
+
         const generationSettings = {
-            ...(currentProfile?.prefixSettings || {}),
-            nodeTransform: currentProfile?.nodeTransform,
+            ...effectivePrefixSettings,
+            nodeTransform: effectiveNodeTransform,
             name: subName
         };
 
@@ -304,18 +327,32 @@ export async function handleMisubRequest(context) {
         });
 
         // [Deferred Logging] Log Success for Base64 (Direct Return)
-        if (!url.searchParams.has('callback_token') && !shouldSkipLogging && config.enableAccessLog) {
-            logAccessSuccess({
-                context,
-                env,
-                request,
-                userAgentHeader,
-                targetFormat,
-                token,
-                profileIdentifier,
-                subName,
-                domain
-            });
+        if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
+            // 发送 Telegram 通知（独立于访问日志开关，只需配置 BotToken 和 ChatID）
+            const clientIp = request.headers.get('CF-Connecting-IP') || 'N/A';
+            context.waitUntil(
+                sendEnhancedTgNotification(
+                    config,
+                    '🛰️ *订阅被访问*',
+                    clientIp,
+                    `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`${targetFormat}\`\n*订阅组:* \`${subName}\``
+                )
+            );
+
+            // 访问日志（需要 enableAccessLog 开关）
+            if (config.enableAccessLog) {
+                logAccessSuccess({
+                    context,
+                    env,
+                    request,
+                    userAgentHeader,
+                    targetFormat,
+                    token,
+                    profileIdentifier,
+                    subName,
+                    domain
+                });
+            }
         }
 
         return new Response(btoa(unescape(encodeURIComponent(contentToEncode))), { headers });
@@ -344,6 +381,7 @@ export async function handleMisubRequest(context) {
                 subconverterUrl.searchParams.set('url', callbackUrl);
                 subconverterUrl.searchParams.set('scv', 'true');
                 subconverterUrl.searchParams.set('udp', 'true');
+                subconverterUrl.searchParams.set('emoji', shouldUseEmoji ? 'true' : 'false');  // 根据模板动态设置 emoji 参数
                 if ((targetFormat === 'clash' || targetFormat === 'loon' || targetFormat === 'surge') && effectiveSubConfig && effectiveSubConfig.trim() !== '') {
                     subconverterUrl.searchParams.set('config', effectiveSubConfig);
                 }
@@ -372,18 +410,32 @@ export async function handleMisubRequest(context) {
                 });
 
                 // [Deferred Logging] Log Success for Subconverter
-                if (!url.searchParams.has('callback_token') && !shouldSkipLogging && config.enableAccessLog) {
-                    logAccessSuccess({
-                        context,
-                        env,
-                        request,
-                        userAgentHeader,
-                        targetFormat,
-                        token,
-                        profileIdentifier,
-                        subName,
-                        domain
-                    });
+                if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
+                    // 发送 Telegram 通知（独立于访问日志开关）
+                    const clientIp = request.headers.get('CF-Connecting-IP') || 'N/A';
+                    context.waitUntil(
+                        sendEnhancedTgNotification(
+                            config,
+                            '🛰️ *订阅被访问*',
+                            clientIp,
+                            `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`${targetFormat}\`\n*订阅组:* \`${subName}\``
+                        )
+                    );
+
+                    // 访问日志（需要 enableAccessLog 开关）
+                    if (config.enableAccessLog) {
+                        logAccessSuccess({
+                            context,
+                            env,
+                            request,
+                            userAgentHeader,
+                            targetFormat,
+                            token,
+                            profileIdentifier,
+                            subName,
+                            domain
+                        });
+                    }
                 }
 
                 return new Response(responseText, { status: subconverterResponse.status, statusText: subconverterResponse.statusText, headers: responseHeaders });
@@ -428,6 +480,19 @@ export async function handleMisubRequest(context) {
 
         // 附带简短错误信息，防止 header 过长
         fallbackHeaders.set('X-MiSub-Error', errorMessage.slice(0, 200));
+
+        // [Fallback Success] 也发送 Telegram 通知，因为用户仍获取了订阅内容
+        if (!url.searchParams.has('callback_token') && !shouldSkipLogging) {
+            const clientIp = request.headers.get('CF-Connecting-IP') || 'N/A';
+            context.waitUntil(
+                sendEnhancedTgNotification(
+                    config,
+                    '🛰️ *订阅被访问* (Fallback)',
+                    clientIp,
+                    `*域名:* \`${domain}\`\n*客户端:* \`${userAgentHeader}\`\n*请求格式:* \`base64\`\n*订阅组:* \`${subName}\``
+                )
+            );
+        }
 
         const fallbackContent = btoa(unescape(encodeURIComponent(combinedNodeList)));
         return new Response(fallbackContent, { headers: fallbackHeaders, status: 200 });
